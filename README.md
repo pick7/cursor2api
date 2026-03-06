@@ -131,14 +131,14 @@ AI 按此格式输出 → 我们解析并转换为标准的 Anthropic `tool_use`
 
 ### v2.3.2 (2026-03-06) — 视觉预处理统一 + OpenAI 防御强化
 
-**� 视觉预处理统一化（修复 [#8](https://github.com/user/cursor2api/issues/8)）**
+** 视觉预处理统一化（修复 [#8](https://github.com/user/cursor2api/issues/8)）**
 - ✨ 新增 `preprocessImages()` 函数：在 `convertToCursorRequest()` 入口统一检测 Anthropic `ImageBlockParam` 图片块
 - ✨ 修复 Claude CLI 选择图片后不进 vision 预处理的 bug — 图片处理从分散的 handler 调用统一到 converter 层
 - ✨ `extractMessageText()` 新增 `case 'image':` 兜底处理，vision 关闭/失败时保留图片元信息而非静默丢弃
 - ✨ Express body 限制从 10MB → 50MB，支持大型 base64 图片传输
 - ✨ 完善日志链路：📸 检测图片 → ✅ 处理成功 / ⚠️ 残留 / ❌ 失败
 
-**�🛡️ OpenAI 端全面防御层对齐**
+**🛡️ OpenAI 端全面防御层对齐**
 - ✨ OpenAI Chat Completions API 端新增完整的拒绝检测 + 自动重试机制（与 Anthropic 端一致）
 - ✨ OpenAI 端新增响应清洗（`sanitizeResponse`），所有输出后处理替换 Cursor 身份引用为 Claude
 - ✨ OpenAI 端新增身份探针拦截（`isIdentityProbe`），拦截"你是谁"等身份询问
