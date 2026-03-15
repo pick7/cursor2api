@@ -619,24 +619,53 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
     let activeCursorReq = cursorReq;
     let retryCount = 0;
 
-    // ★ 实时流式转发 + 内联 thinking 处理
-    // 1. <thinking> 出现 → 缓冲（不发给客户端）
-    // 2. </thinking> 出现 → 立即发送 thinking block，increment blockIndex
-    // 3. 后续文本 → 实时流式转发为 text blocks
-    // 4. ```json 出现 → 暂停实时流（等待完整 JSON 解析）
+    // ★ Thinking 安全流式策略
+    // 问题：Anthropic API 要求 thinking blocks 在 text blocks 之前发送
+    //       但流式传输时 <thinking> 标签可能不在第一个 delta 中出现
+    //       如果先发了 text_delta 再发 thinking_delta，客户端报错：
+    //       "Mismatched content block type content_block_delta text"
+    // 方案：当 thinking 可能出现时，完全缓冲响应，让后处理统一排序
+    const config = getConfig();
+    const clientExplicitThinking = body.thinking?.type === 'enabled';
+    const thinkingMightBePresent = clientExplicitThinking || (body.thinking?.type !== 'disabled' && !!config.enableThinking);
+    // 当 thinking 可能存在时，禁止内联流式（让后处理统一排序 thinking → text）
+    const suppressInlineStream = thinkingMightBePresent;
+
     let streamingPaused = false;
     let thinkingSent = false; // 标记 thinking block 是否已内联发送
+    // 检测缓冲：即使 thinking 未启用，也缓冲前 N 个字符以检测意外的 <thinking> 标签
+    const DETECTION_BUFFER_SIZE = 50;
+    let detectionPhase = !suppressInlineStream; // 仅在非全缓冲模式下使用检测缓冲
 
     const executeStream = async () => {
         fullResponse = '';
         streamingPaused = false;
         thinkingSent = false;
+        detectionPhase = !suppressInlineStream;
         await sendCursorRequest(activeCursorReq, (event: CursorSSEEvent) => {
             if (event.type !== 'text-delta' || !event.delta) return;
             fullResponse += event.delta;
 
-            // 重试时不实时转发
-            if (retryCount > 0) return;
+            // 全缓冲模式（thinking 可能存在）或重试时：只积累不转发
+            if (suppressInlineStream || retryCount > 0) return;
+
+            // 检测缓冲阶段：累积前 N 个字符以检测意外的 <thinking> 标签
+            if (detectionPhase) {
+                if (fullResponse.includes('<thinking>')) {
+                    // 意外发现 thinking 标签！切换到全缓冲模式
+                    console.log(`[Handler] 检测到意外 <thinking> 标签，切换到全缓冲模式`);
+                    detectionPhase = false;
+                    return; // 此后所有 delta 都不实时发送
+                }
+                if (fullResponse.length < DETECTION_BUFFER_SIZE) {
+                    return; // 继续缓冲
+                }
+                // 检测缓冲完成，没发现 thinking → 进入正常流式模式
+                detectionPhase = false;
+            }
+
+            // 如果在检测缓冲期间发现了 thinking（上面 return 了），之后不再流式
+            if (fullResponse.includes('<thinking>')) return;
 
             // 工具模式：检测到 ```json 后暂停实时流式
             if (hasTools && !streamingPaused) {
@@ -646,45 +675,9 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
                 }
             }
 
-            // 正在 <thinking> 内部：缓冲等待 </thinking>
-            if (fullResponse.includes('<thinking>') && !fullResponse.includes('</thinking>')) {
-                return;
-            }
-
-            // </thinking> 刚闭合：立即提取并发送 thinking block
-            if (!thinkingSent && fullResponse.includes('</thinking>')) {
-                const thinkMatch = fullResponse.match(/<thinking>([\s\S]*?)<\/thinking>/);
-                if (thinkMatch) {
-                    const thinkContent = thinkMatch[1].trim();
-                    if (thinkContent) {
-                        // 发送 thinking block（在 text 之前）
-                        writeSSE(res, 'content_block_start', {
-                            type: 'content_block_start', index: blockIndex,
-                            content_block: { type: 'thinking', thinking: '' },
-                        });
-                        writeSSE(res, 'content_block_delta', {
-                            type: 'content_block_delta', index: blockIndex,
-                            delta: { type: 'thinking_delta', thinking: thinkContent },
-                        });
-                        writeSSE(res, 'content_block_delta', {
-                            type: 'content_block_delta', index: blockIndex,
-                            delta: { type: 'signature_delta', signature: 'cursor2api-thinking' },
-                        });
-                        writeSSE(res, 'content_block_stop', {
-                            type: 'content_block_stop', index: blockIndex,
-                        });
-                        blockIndex++;
-                    }
-                }
-                thinkingSent = true;
-                // 将 sentText 指针跳过 thinking 块
-                const thinkEnd = fullResponse.indexOf('</thinking>') + '</thinking>'.length;
-                sentText = fullResponse.substring(0, thinkEnd);
-            }
-
-            // 发送 thinking 之后的文本（或无 thinking 时直接发送）
-            if (!streamingPaused && (thinkingSent || !fullResponse.includes('<thinking>'))) {
-                const unsent = fullResponse.substring(sentText.length).replace(/^\n+/, ''); // 去掉 thinking 后的多余换行
+            // 正常文本流式转发（无 thinking 的情况）
+            if (!streamingPaused) {
+                const unsent = fullResponse.substring(sentText.length);
                 if (unsent) {
                     if (!textBlockStarted) {
                         writeSSE(res, 'content_block_start', {
@@ -751,18 +744,13 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
         }
 
         // ★ Thinking 处理：由客户端 body.thinking 参数控制，回退到服务端配置
-        const config = getConfig();
-        const clientExplicitThinking = body.thinking?.type === 'enabled';
         const thinkingEnabled = clientExplicitThinking || (body.thinking?.type !== 'disabled' && !!config.enableThinking);
         let thinkingBlocks: Array<{ thinking: string }> = [];
         if (fullResponse.includes('<thinking>')) {
             const extracted = extractThinking(fullResponse);
             fullResponse = extracted.cleanText;
 
-            if (thinkingSent) {
-                // thinking 已在实时流中内联发送，不再重复
-                console.log(`[Handler] Thinking 已在流中内联发送，跳过后处理`);
-            } else if (hasTools && !clientExplicitThinking) {
+            if (hasTools && !clientExplicitThinking) {
                 // 工具模式 + 客户端未明确开启：丢弃 thinking（节省输出预算）
                 const thinkingChars = extracted.thinkingBlocks.reduce((s, b) => s + b.thinking.length, 0);
                 if (thinkingChars > 0) {
@@ -901,14 +889,16 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
         }
 
         // ★ 先发送 thinking 块（在 text 和 tool_use 之前）
-        for (const tb of thinkingBlocks) {
+        // Anthropic API 要求每个响应只有一个 thinking block，合并多个块
+        if (thinkingBlocks.length > 0) {
+            const mergedThinking = thinkingBlocks.map(tb => tb.thinking).join('\n\n');
             writeSSE(res, 'content_block_start', {
                 type: 'content_block_start', index: blockIndex,
                 content_block: { type: 'thinking', thinking: '' },
             });
             writeSSE(res, 'content_block_delta', {
                 type: 'content_block_delta', index: blockIndex,
-                delta: { type: 'thinking_delta', thinking: tb.thinking },
+                delta: { type: 'thinking_delta', thinking: mergedThinking },
             });
             // 发送 signature delta（Anthropic API 要求）
             writeSSE(res, 'content_block_delta', {
@@ -1278,11 +1268,11 @@ async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body
 
     const contentBlocks: AnthropicContentBlock[] = [];
 
-    // 先添加 thinking content blocks
-    for (const tb of thinkingBlocks) {
+    // 先添加 thinking content block（合并多个为一个）
+    if (thinkingBlocks.length > 0) {
         contentBlocks.push({
             type: 'thinking',
-            thinking: tb.thinking,
+            thinking: thinkingBlocks.map(tb => tb.thinking).join('\n\n'),
             signature: 'cursor2api-thinking',
         });
     }

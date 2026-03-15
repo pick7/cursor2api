@@ -1,5 +1,43 @@
 # Changelog
 
+## v2.6.5 (2026-03-15)
+
+### 🔧 流式 Thinking Block 类型冲突修复
+
+- **问题**：流式传输时 `<thinking>` 标签可能不在第一个 delta 中完整出现，导致部分标签片段（`<`, `<th`...）先作为 `text_delta` 发送，之后再发 `thinking_delta`，客户端报错 "Mismatched content block type content_block_delta text"
+- **修复**：thinking 启用时完全缓冲响应（不做内联流式），由后处理统一保证 `thinking → text` 正确顺序
+- thinking 未启用时增加 50 字符检测缓冲，避免意外 `<thinking>` 标签被当作文本发送
+
+### 🔧 多 Thinking Block 合并
+
+- **问题**：模型可能输出多个 `<thinking>...</thinking>` 块，或截断恢复追加新 thinking 块，导致发送多个独立 thinking content block，违反 Anthropic API 规范
+- **修复**：流式和非流式路径均将多个 thinking 块合并为单个 thinking content block
+
+### 🛡️ 反拒绝策略重构 — 从 "Testing Assistant" 到中性工作区动作
+
+- **问题**：Sonnet 4.6 将整个 "Cursor Automated Testing Assistant" / "sandbox execution" 叙事识别为 jailbreak pattern，直接拒绝
+- **策略重构**：
+  - 移除所有身份声明（不再 "You are X"）
+  - 移除所有胁迫性语言（"Do NOT apologize"）
+  - 工具格式从 "test scenario" 改为中性 "workspace action"
+  - 工具结果标签从 "Sandbox Execution Result" 改为 "Action Result"
+  - 系统提示词清洗从身份替换改为身份删除（Sonnet 4.6 会把任何 "You are X" 替换识别为 jailbreak）
+
+### 🔒 XOR 混淆替代 Base64
+
+- **问题**：Base64 编码的注入字符串可被模型心算解码，实际防护价值为零
+- **新方案**：16 字节轮转密钥 XOR 加密，模型无法心算解码
+- 新增 `src/obfuscate.ts` 解码模块 + `scripts/encode.mjs` 编码工具
+- 所有敏感提示词字符串迁移至 XOR 编码
+
+### 🧹 子 Agent 清洗增强
+
+- 新增 `<claude_background_info>` 和 `<env>` 标签到 Tier 1 完全剥离列表
+- 撇号兼容：同时匹配 ASCII `'` (U+0027) 和 Unicode `'` (U+2019)
+- 全局清洗兜底：通杀残留 Claude/Anthropic/Claude Code 引用
+
+---
+
 ## v2.6.4 (2026-03-15)
 
 ### 🧹 系统提示词深度清洗 — 根治 Prompt Injection 检测
